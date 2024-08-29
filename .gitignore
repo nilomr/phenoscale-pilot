@@ -380,3 +380,6 @@ docs/_build/
 
 # manifest
 MANIFEST.in
+
+.venv/
+.venv/*
