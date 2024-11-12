@@ -27,18 +27,25 @@ file_paths = [
     for sk, sv in v.items()
     for path in sv
 ]
+
+# print folder names in file_paths
+print("Folder names in file_paths:")
+print(pd.Series([path.parent.name for path in file_paths]).value_counts())
+
+existing_files = {
+    (file.stem.split("_", 1)[0], file.stem.split("_", 1)[1])
+    for file in DETECTIONS_DIR.iterdir()
+    if file.suffix == ".json"
+}
+
 file_paths = [
     path
     for path in tqdm(file_paths)
     if path.suffix in [".wav", ".WAV"]
     and os.path.getsize(path) > 10
-    and [path.parent.name, path.stem]
-    not in [
-        file.stem.split("_", 1)
-        for file in DETECTIONS_DIR.iterdir()
-        if file.suffix == ".json"
-    ]
+    and (path.parent.name, path.stem) not in existing_files
 ]
+
 print(f"Found {len(file_paths)} files")
 
 # ──── MAIN ───────────────────────────────────────────────────────────────────
@@ -102,7 +109,7 @@ def process_file_and_save(file_path):
 
 def process_files(file_paths):
     with tqdm(total=len(file_paths), desc="Processing files") as pbar:
-        ncore = os.cpu_count() - 1
+        ncore = os.cpu_count()
         print(f"Using {ncore} cpus")
         pool = multiprocessing.Pool(processes=ncore)
         for _ in pool.imap_unordered(process_file_and_save, file_paths):
