@@ -1,16 +1,13 @@
 import os
 from pathlib import Path
 
-import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
-import networkx as nx
 import numpy as np
 import polars as pl
-import pyproj
-import seaborn as sns
+import statsmodels.nonparametric.smoothers_lowess as lowess
+from astral import LocationInfo
+from astral.sun import sun
 from labellines import labelLines
-from matplotlib.lines import Line2D
-from sklearn.metrics import euclidean_distances
 
 from src.plot import (
     cm,
@@ -267,6 +264,142 @@ for experiment in df["experiment"].unique().to_list():
         transparent=True,
     )
 
+# Calculate the total proportion reduction in the number of unique species detected if we had sampled every other day (for each experiment and device)
+
+# Calculate the total number of unique species detected for each experiment and device
+total_species = cum_unique_species.group_by(["experiment", "device"]).agg(
+    pl.col("cumulative_unique_species").list.len().alias("total_species")
+)
+
+# Calculate the total number of unique species detected for each experiment and device when sampled every other day
+alt_total_species = alt_cum_species.group_by(["experiment", "device"]).agg(
+    pl.col("cumulative_unique_species").list.len().alias("alt_total_species")
+)
+
+# Merge the two dataframes
+merged_species = total_species.join(
+    alt_total_species, on=["experiment", "device"], how="inner"
+)
+
+# Calculate the proportion reduction
+merged_species = merged_species.with_columns(
+    (
+        (
+            pl.col("total_species").list.max()
+            - pl.col("alt_total_species").list.max()
+        )
+        / pl.col("total_species").list.max()
+    ).alias("proportion_reduction")
+)
+
+# add columns for max species detected and max species detected on alternate
+# days, and difference between the two
+merged_species = merged_species.with_columns(
+    pl.col("total_species").list.max().alias("max_species"),
+    pl.col("alt_total_species").list.max().alias("max_species_alt"),
+)
+
+merged_species = merged_species.with_columns(
+    (pl.col("max_species") - pl.col("max_species_alt")).alias(
+        "species_difference"
+    ),
+)
+
+# Print the results
+print(merged_species)
+
+# plot max species detected and max species detected on alternate days for each
+# device and experiment. plot each number as a point and join them with a line.
+# species count in the y axis and device in the x axis. color by experiment.
+
+# Create plot
+aspect_ratio = 0.8
+plt.figure(figsize=(width * cm, (width * cm) / aspect_ratio))
+
+# Plot data for each experiment
+# Pre-calculate x positions for all experiments
+x_positions = []
+current_x = 0
+experiment_start_positions = {}
+
+for experiment in merged_species["experiment"].unique():
+    exp_data = merged_species.filter(pl.col("experiment") == experiment)
+    positions = [current_x + j * 0.6 for j in range(len(exp_data))]
+    x_positions.extend(positions)
+    experiment_start_positions[experiment] = positions
+    current_x = positions[-1] + 1.2  # Add larger gap between experiments
+
+# Plot data using pre-calculated positions
+for i, experiment in enumerate(merged_species["experiment"].unique()):
+    exp_data = merged_species.filter(pl.col("experiment") == experiment)
+    x_pos = experiment_start_positions[experiment]
+
+    # Plot arrows showing direction of change
+    for x, full, alt in zip(
+        x_pos, exp_data["max_species"], exp_data["max_species_alt"]
+    ):
+        # Determine arrow direction
+        if alt > full:
+            plt.arrow(
+                x,
+                full,
+                0,
+                alt - full,
+                head_width=0.4,
+                head_length=0.8,
+                color=palette[i],
+                alpha=0.7,
+            )
+        elif alt < full:
+            plt.arrow(
+                x,
+                full,
+                0,
+                alt - full,
+                head_width=0.4,
+                head_length=0.8,
+                color=palette[i],
+                alpha=0.7,
+            )
+        elif alt == full:
+            plt.plot(x, full, "o", color=palette[i])
+
+        # Plot only the higher point
+        plt.plot(
+            x,
+            max(full, alt),
+            "o",
+            color=palette[i],
+            label=experiment if x == x_pos[0] else "",
+        )
+
+# Customize plot
+ax = plt.gca()
+set_y_ticks(ax, num_ticks=5, decimals=0, ymin=0)
+set_y_axis_title(ax, "Species", offset=2)
+# set x axes ticks (experiment, with each tick at the mean of the x positions for that experiment)
+x_ticks = [
+    np.mean(experiment_start_positions[exp])
+    for exp in merged_species["experiment"].unique()
+]
+plt.xticks(x_ticks, merged_species["experiment"].unique())
+set_plot_title(
+    ax,
+    "Species Detection Comparison",
+    "Full vs. Alternate Day Sampling",
+    subtitle_pad=0.6,
+    title_pad=0.13,
+)
+plt.legend()
+
+# Save plot
+plt.savefig(
+    output_dir / "species_comparison_by_device.svg",
+    format="svg",
+    bbox_inches="tight",
+    transparent=True,
+)
+
 
 # Bar chart of species counts
 
@@ -332,6 +465,7 @@ plt.savefig(
     transparent=True,
 )
 
+
 # Plot when in the day detections are made for each species and experiment
 # Extract hour from detection_time
 # Extract hour and minute,
@@ -348,82 +482,236 @@ df_times = df.with_columns(
         ).alias("time_bin"),
     ]
 )
+# Group by species, experiment, date, and time bin to get counts
+df_times = df_times.with_columns(
+    pl.col("detection_time").dt.date().alias("detection_date")
+)
 
-
-# Group by species, experiment, and time bin to get counts
 binned_counts = (
-    df_times.group_by(["common_name", "experiment", "time_bin"])
+    df_times.group_by(
+        ["common_name", "experiment", "detection_date", "time_bin"]
+    )
     .len()
-    .sort(["experiment", "common_name", "time_bin"])
+    .sort(["experiment", "common_name", "detection_date", "time_bin"])
 )
 
-# Create all possible time bins (0 to 143 for 24 hours * 6 bins per hour)
-all_bins = pl.DataFrame({"time_bin": pl.Series(range(144), dtype=pl.Int16)})
-
-# Create all combinations of species, experiments and time bins
-species_df = pl.DataFrame({"common_name": df["common_name"].unique().to_list()})
-experiment_df = pl.DataFrame(
-    {"experiment": df["experiment"].unique().to_list()}
-)
-template = species_df.join(experiment_df, how="cross").join(
-    all_bins, how="cross"
-)
-
-# Join with actual counts and fill missing values with 0
-# ensure both time bin columns are of the same type (int16)
-template = template.with_columns(pl.col("time_bin").cast(pl.Int16))
-binned_counts = binned_counts.with_columns(pl.col("time_bin").cast(pl.Int16))
-
-binned_counts = template.join(
-    binned_counts, on=["common_name", "experiment", "time_bin"], how="left"
-).with_columns(pl.col("len").fill_null(0))
-
-# TODO
-# preserve the date column, then at this point calculate how far from sunrise or
-# sunset the detections are made. Then plot in two sections, one for AM and one
-# for PM, not as 'time_bin' but as 'time_from_sunrise' and 'time_from_sunset' as
-# this will be more informative.
-
-
-# Get species with more than 3 detections for the plot
-species_to_plot = species_counts["common_name"].unique().to_list()
-
-# Plot detections by time bin for one sample species in one experiment
-sample_species = species_to_plot[0]
-sample_experiment = experiments[0]
-
-sample_data = hourly_counts.filter(
-    (pl.col("common_name") == sample_species)
-    & (pl.col("experiment") == sample_experiment)
+# Fill any missing values with 0
+binned_counts = binned_counts.with_columns(
+    [
+        pl.col("time_bin").cast(pl.Int16),
+        # Add bin start time
+        (
+            pl.col("time_bin")
+            .map_elements(lambda x: f"{x//6:02d}:{(x%6)*10:02d}")
+            .str.strptime(pl.Time, "%H:%M")
+        ).alias("bin_start"),
+    ]
 )
 
-# Create plot with specified dimensions
-plt.figure(figsize=(width * cm, (width * cm) / aspect_ratio))
 
-# Convert time bins to actual time for x-axis
-time_labels = [f"{(bin // 6):02d}:{(bin % 6 * 10):02d}" for bin in range(144)]
+# Calculate sunrise and sunset times for each date
 
-# Plot the data
-plt.plot(sample_data["time_bin"], sample_data["len"])
+# Get location from metadata (first row)
+lat = metadata["Latitude"][0]
+lon = metadata["Longitude"][0]
+location = LocationInfo("Site", "UK", "UTC", lat, lon)
 
-# Customize plot
-ax = plt.gca()
-set_x_ticks(ax, num_ticks=8, decimals=0, xmin=0, xmax=143)
-tick_positions = ax.get_xticks().astype(int)
-tick_positions = np.clip(tick_positions, 0, 143)
-ax.set_xticklabels([time_labels[i] for i in tick_positions])
-set_y_ticks(ax, num_ticks=5, decimals=0, ymin=0)
-set_y_axis_title(ax, "Number of Detections", offset=2)
-set_x_axis_title(ax, "Time of Day")
-set_plot_title(
-    ax,
-    f"{sample_species} - {sample_experiment}",
-    "Daily Detection Pattern",
-    subtitle_pad=0.6,
-    title_pad=0.13,
+
+# Create function to get sun times for a date
+def get_sun_times(date):
+    s = sun(location.observer, date)
+    return s["sunrise"], s["sunset"]
+
+
+# Calculate sunrise/sunset for each unique date
+dates = df["detection_time"].dt.date().unique().to_list()
+sun_times = {date: get_sun_times(date) for date in dates}
+
+# Add sunrise/sunset times for that day as a new column to binned_counts
+binned_counts = binned_counts.with_columns(
+    pl.col("detection_date")
+    .map_elements(lambda x: sun_times[x][0])
+    .alias("sunrise"),
+    pl.col("detection_date")
+    .map_elements(lambda x: sun_times[x][1])
+    .alias("sunset"),
 )
 
-# Add vertical lines to separate AM and PM recording periods
-# First, analyze the data to find the actual recording periods. the second part
-# of the file_name in df contains the recording times '20240625_031700'. we can
-# use this to find the start and end times of the recording periods
+# For each row calculate the time from bin start to sunrise and sunset. just
+# subtract the bin_start column from the sunrise and sunset columns (bin_start -
+# sunrise, bin_start - sunset). 2
+
+# You can try using the Expr.sub() function instead of the - operator:
+
+#  (pl.from_records([{'start': '2021-01-01', 'end': '2022-01-01'}])
+#  .with_columns(pl.col(['start', 'end']).str.to_date('%Y-%m-%d'))
+#  .with_columns(delta = pl.col('end').sub(pl.col('start'))))
+
+# Calculate minutes from sunrise and sunset
+binned_counts = binned_counts.with_columns(
+    [
+        pl.col("detection_date")
+        .dt.combine(pl.col("bin_start"))
+        .sub(pl.col("sunrise"))
+        .dt.total_minutes()
+        .alias("minutes_from_sunrise"),
+        pl.col("detection_date")
+        .dt.combine(pl.col("bin_start"))
+        .sub(pl.col("sunset"))
+        .dt.total_minutes()
+        .alias("minutes_from_sunset"),
+    ]
+)
+
+# Get absolute values and add AM/PM flag
+binned_counts = binned_counts.with_columns(
+    [
+        pl.col("minutes_from_sunrise").abs().alias("minutes_from_sunrise_abs"),
+        pl.col("minutes_from_sunset").abs().alias("minutes_from_sunset_abs"),
+    ]
+)
+
+# Add time of day flag, AM if minutes_from_sunrise_abs < minutes_from_sunset_abs
+binned_counts = binned_counts.with_columns(
+    pl.when(
+        pl.col("minutes_from_sunrise_abs") < pl.col("minutes_from_sunset_abs")
+    )
+    .then(pl.lit("AM"))
+    .otherwise(pl.lit("PM"))
+    .alias("time_of_day")
+)
+
+
+# order based on experiment, count.
+binned_counts = binned_counts.sort(["experiment", "len"])
+
+# For AM data, check what the largest negative value is
+binned_counts.filter(pl.col("time_of_day") == "AM").select(
+    "minutes_from_sunrise"
+).min()
+
+
+# Take a sample species from the first experiment and plot 'count' vs
+# 'minutes_from_sunrise_abs' or 'minutes_from_sunset_abs' for AM and PM
+# as a time series. with a subplot for AM and PM detections
+
+# Get first experiment and a sample species
+experiment = binned_counts["experiment"].unique()[1]
+# get unique species, in order of total count
+species = (
+    binned_counts.filter(pl.col("experiment") == experiment)
+    .group_by("common_name")
+    .agg(pl.col("len").sum())
+    .sort("len", descending=True)
+    .select("common_name")
+)
+species = species["common_name"][5]
+
+
+def plot_detection_timing(ax, data, period, palette, y_max):
+    """Plot detection timing data for a given period (AM/PM)."""
+    # Plot raw data points
+    ax.plot(
+        data[f"minutes_from_{period[1]}"], data["len"], "|", color=palette[0]
+    )
+
+    # Calculate and plot LOWESS smoothing
+    x = data[f"minutes_from_{period[1]}"].to_numpy()
+    y = data["len"].to_numpy()
+    loess = lowess.lowess(y, x, frac=1, it=5)
+    ax.plot(loess[:, 0], loess[:, 1], "-", color=palette[0], alpha=0.8)
+
+    # Add reference line at sunrise/sunset
+    ax.axvline(x=0, color="orange", linestyle="-", alpha=0.4, linewidth=1.4)
+
+    # Set axis properties
+    set_y_ticks(ax, num_ticks=5, decimals=0, ymin=0, ymax=y_max)
+    if period[0] == "AM":
+        ax.set_xticks([0, 50, 100])
+        ax.set_xlim(-40, 130)
+    else:
+        ax.set_xticks([-100, -50, 0])
+        ax.set_xlim(-130, 40)
+
+    # Set labels
+    ax.set_xlabel(f"Minutes from {period[1]}")
+    ax.set_ylabel("Detections")
+    ax.set_title(f"{'Morning' if period[0]=='AM' else 'Evening'} detections")
+
+
+def get_species_list(binned_counts, experiment):
+    """Get ordered list of species for an experiment."""
+    return (
+        binned_counts.filter(pl.col("experiment") == experiment)
+        .group_by("common_name")
+        .agg(pl.col("len").sum())
+        .sort("len", descending=True)
+        .select("common_name")
+    )["common_name"]
+
+
+def process_species_data(binned_counts, experiment, species):
+    """Get filtered data for a species in an experiment."""
+    return binned_counts.filter(
+        (pl.col("experiment") == experiment)
+        & (pl.col("common_name") == species)
+        & (pl.col("len") > 0)
+    )
+
+
+def setup_timing_plot(width, aspect_ratio):
+    """Create and setup the figure and axes."""
+    return plt.subplots(
+        1, 2, figsize=(width * 2 * cm, (width * cm) / aspect_ratio)
+    )
+
+
+def save_timing_plot(fig, output_dir, experiment, species):
+    """Save the plot to file."""
+    plt.suptitle(f"{species} - {experiment}")
+    plt.tight_layout()
+    filename = f"timing_{experiment}_{species.replace(' ', '_')}.svg"
+    plt.savefig(
+        output_dir / filename,
+        format="svg",
+        bbox_inches="tight",
+        transparent=False,
+    )
+    plt.close()
+
+
+def create_timing_plots(
+    binned_counts, output_dir, width, aspect_ratio, palette
+):
+    """Create timing plots for all experiments and species."""
+    for experiment in binned_counts["experiment"].unique():
+        species_list = get_species_list(binned_counts, experiment)
+
+        for species in species_list:
+            data = process_species_data(binned_counts, experiment, species)
+            if len(data) <= 10:
+                continue
+
+            fig, (ax1, ax2) = setup_timing_plot(width, aspect_ratio)
+
+            # Plot morning and evening data
+            plot_detection_timing(
+                ax1,
+                data.filter(pl.col("time_of_day") == "AM"),
+                ("AM", "sunrise"),
+                palette,
+                data["len"].max(),
+            )
+            plot_detection_timing(
+                ax2,
+                data.filter(pl.col("time_of_day") == "PM"),
+                ("PM", "sunset"),
+                palette,
+                data["len"].max(),
+            )
+
+            save_timing_plot(fig, output_dir, experiment, species)
+
+
+# Main execution
+create_timing_plots(binned_counts, output_dir, width, aspect_ratio, palette)
